@@ -1,0 +1,6 @@
+[db_servers]
+primary ansible_ssh_host=1.2.3.4
+standby0 ansible_ssh_host=1.2.3.5
+
+[standbys]
+standby0 ansible_ssh_host=1.2.3.5

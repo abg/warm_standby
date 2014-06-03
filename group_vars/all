@@ -1,0 +1,5 @@
+## Default interface we use for the internal ip
+## Used primarily by the pg_wal_archive config template
+## when configuring warm standby servers that the
+## primary should ship WAL to
+iface: '{{ ansible_default_ipv4.interface }}'

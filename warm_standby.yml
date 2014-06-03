@@ -1,0 +1,148 @@
+---
+# This Playbook deploys Postgres 8.4 with one or more warm standby instances
+
+- hosts: all
+  sudo: yes
+  sudo_user: root
+
+  tasks:
+  - name: install yum.postgresql.org repo
+    yum: name={{ item }} state=installed
+    with_items:
+     - http://yum.postgresql.org/8.4/redhat/rhel-6-x86_64/pgdg-centos-8.4-3.noarch.rpm
+
+  - name: install postgres packages
+    yum: name={{ item}} state=installed
+    with_items:
+     - postgresql84
+     - postgresql84-server
+     - postgresql84-contrib
+     - postgresql84-libs
+     - rsync
+
+  - name: Add Postgres 8.4 utilities to default profile
+    copy: dest=/etc/profile.d/pgsql84.sh
+          content="pathmunge /usr/pgsql-8.4/bin"
+          owner=root
+          group=root
+          mode=0644
+          force=no
+
+  - name: stop postgres instance
+    service: name=postgresql-8.4 state=stopped
+
+  ## Generate a ssh public/private key pair used for both wal archiving
+  ## and for copying a base backup
+  - name: create ssh key for postgres user
+    user: name=postgres generate_ssh_key=yes ssh_key_bits=2048
+
+  # Copies the generated public key for each host locally into public_keys directory
+  # These will be named public_keys/{hostname} and have one public key for each host
+  - name: Fetch ssh key for postgres user
+    fetch: src=/var/lib/pgsql/.ssh/id_rsa.pub
+           dest=public_keys/{{ inventory_hostname }}.pub
+           flat=yes
+
+  ## Adds all .pub files from the local public_keys directory to each postgres
+  ## user's authorized_keys file.  Additional keys might be added here where useful
+  - name: Ensure authorized_keys are updated for each host
+    authorized_key: user=postgres key="{{ lookup('file', item) }}"
+    with_fileglob:
+     - public_keys/*.pub
+
+  - name: Create pgsql ./bin directory for warm standby scripts
+    file: path=/var/lib/pgsql/bin
+          state=directory
+          owner=postgres
+          group=postgres
+          mode=0755
+
+  - name: Install pg_wal_archive script
+    copy: src=files/pg_wal_archive
+          dest=/var/lib/pgsql/bin/pg_wal_archive
+          owner=postgres
+          group=postgres
+          mode=0755
+
+  - name: Install pg_wal_archive config
+    template: src=templates/pg_wal_archive.sysconfig.in
+              dest=/etc/sysconfig/pg_wal_archive
+              owner=postgres
+              group=postgres
+              mode=0440
+
+  - name: Install basebackup script
+    copy: src=files/basebackup.sh
+          dest=/var/lib/pgsql/bin/basebackup.sh
+          owner=postgres
+          group=postgres
+          mode=0755
+
+  - name: Install resync script
+    template: src=templates/resync.sh
+              dest=/var/lib/pgsql/bin/resync.sh
+              owner=postgres
+              group=postgres
+              mode=0755
+
+  - name: initialize database
+    command: service postgresql-8.4 initdb
+             creates=/var/lib/pgsql/8.4/data/postgresql.conf
+
+  # XXX: This should probably be copying a template postgresql.conf
+  #      but this method avoids overwriting local changes
+  - name: Enable archive_mode
+    lineinfile: dest=/var/lib/pgsql/8.4/data/postgresql.conf
+                regexp="^#?archive_mode"
+                line="archive_mode = on"
+
+  - name: Enable archive_command
+    lineinfile: dest=/var/lib/pgsql/8.4/data/postgresql.conf
+                regexp=^#?archive_command
+                line="archive_command = '/var/lib/pgsql/bin/pg_wal_archive %p'"
+
+  - name: Enable archive_timeout
+    lineinfile: dest=/var/lib/pgsql/8.4/data/postgresql.conf
+                regexp="^#?archive_timeout"
+                line="archive_timeout = 60s"
+
+  - name: create the WAL archive directory
+    file: path=/var/lib/pgsql/8.4/archive
+          state=directory
+          owner=postgres
+          group=postgres
+
+  - name: start postgres instance
+    service: name=postgresql-8.4 state=started
+
+
+## These actions are run only for standby servers
+## This is responsible for:
+##      - copying a base backup from the primary
+##      - generating a useful recovery.conf
+##      - Starting the standby
+
+- hosts: standbys
+  tasks:
+  - name: Stop standby instance
+    service: name=postgresql-8.4 state=stopped
+
+  ## this runs the actual SELECT pg_start_backup() / rsync / SELECT pg_stop_backup()
+  ## Note: with Postgres 8.4 only a single basebackup can be in flight at a single time
+  ## iface comes from group_vars/all and assumes the primary interface by default
+  ## but this may need to be changed based on the deployed environment
+  - name: Copy primary data to standbys
+    script: ./files/basebackup.sh "{{ hostvars.primary['ansible_' + iface].ipv4.address }}"
+    sudo: yes
+    sudo_user: postgres
+
+  - name: Copy recovery.conf to standby
+    copy: src=files/recovery.conf
+          dest=/var/lib/pgsql/8.4/data/recovery.conf
+          owner=postgres
+          group=postgres
+          mode=0600
+          backup=yes
+
+  - name: Start standby instance
+    service: name=postgresql-8.4 state=started

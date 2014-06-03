@@ -1,0 +1,77 @@
+#!/bin/bash
+
+prog="${0##*/}"
+
+# Space delimited hostnames
+# Default: No hosts defined.  Archive command will fail
+#WARM_STANDBY_HOSTS='127.0.0.1 192.168.1.1'
+WARM_STANDBY_HOSTS=""
+SSH_OPTS="-o ConnectTimeout=10 -o StrictHostKeyChecking=no -o BatchMode=yes"
+RSYNC_OPTS="-avz"
+VERBOSE=1
+ARCHIVE_DIR=/var/lib/pgsql/8.4/archive
+
+log() {
+    echo "$(date "+%F %T %Z"):${USER}@${HOSTNAME}: $0: $*" 2>&1
+}
+
+[ -e /etc/sysconfig/$prog ] && . /etc/sysconfig/$prog
+
+if [[ $# != 1 ]]
+then
+    echo "Usage: $0 <wal-file>" 2>&1
+    exit 1
+fi
+
+if [[ -z "$WARM_STANDBY_HOSTS" ]]
+then
+    log "No standby hosts configured"
+    exit 1
+fi
+
+mkdir -p ${ARCHIVE_DIR}/main
+
+src=$1
+src_basename=${src##*/}
+
+cp "${src}" "${ARCHIVE_DIR}/main/${src_basename}"
+exit_status=$?
+
+# only hard-link if the initial cp queuing command succeeded
+[[ $exit_status -eq 0 ]] &&
+for host in $WARM_STANDBY_HOSTS
+do
+    [[ -d "${ARCHIVE_DIR}/${host}" ]] || mkdir -p "${ARCHIVE_DIR}/${host}"
+    # hardlink from main -> ${host}
+    ln "${ARCHIVE_DIR}/main/${src_basename}" "${ARCHIVE_DIR}/${host}/${src_basename}"
+    # if hardlinking fails, the host will never queue up the WAL
+    # ensure exit_status is non-zero so we retry later
+    [[ $? != 0 ]] && exit_status=1
+done
+
+# old rsync uses --remove-sent-files, but recent rsync uses --remove-source-files
+remove_source_files_opt=$(rsync --help | awk '/^ *--remove-.*-files/ { print $1; }')
+RSYNC_OPTS="${RSYNC_OPTS} ${remove_source_files_opt}"
+# flush queue for each host
+for host in $WARM_STANDBY_HOSTS
+do
+    while read line
+    do
+        log "${line}"
+    done < <(rsync ${RSYNC_OPTS} \
+                   -e "ssh ${SSH_OPTS}" \
+                   "${ARCHIVE_DIR}/${host}/" \
+                   "${host}:${ARCHIVE_DIR}" 2>&1)
+    # here we don't care about the exit status - if it succeeded we deleted all the queued
+    # files. otherwise, we'll attempt it next go around.  Postgres shouldn't care -
+    # we have successfully archived the wal log to ${archive}/main/ and hardlinked to
+    # the host queue
+done
+
+# purge stale WAL logs
+# delete files with only a single link
+# these won't be hard linked in a ${host} directory and if hardlinking previously failed
+# these are already duplicated in pg_xlog.
+find "${ARCHIVE_DIR}/main/" -type f -links 1 -delete
+
+exit $exit_status

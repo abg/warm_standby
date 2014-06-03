@@ -1,0 +1,5 @@
+public_keys/ is used as a scratch area for the warm_standby playbook to stage
+the public ssh keys for the postgres user across each server involved in a
+warm standby setup.  Each server's public key is added to the postgres
+user's authorized_keys file to allow for bidireclty data transfer to allow
+copying WAL and base backups from the primary to the secondary instances.

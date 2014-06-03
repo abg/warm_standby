@@ -1,0 +1,7 @@
+RSYNC_OPTS="-az --compress-level=1"
+#SSH_OPTS="-o ConnectTimeout=10 -o StrictHostKeyChecking=no -o BatchMode=yes"
+WARM_STANDBY_HOSTS="
+{% for host in groups['standbys'] %}
+{{ hostvars[host]['ansible_' + iface].ipv4.address }}
+{% endfor %}
+"
